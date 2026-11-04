@@ -1,0 +1,1018 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Career &amp; Debt Planner</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js" crossorigin></script>
+  <style>
+    input[type=range] { accent-color: #2563eb; }
+    * { box-sizing: border-box; }
+    .spin { animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body class="bg-gray-50">
+<div id="root"></div>
+<script>
+// ─────────────────────────────────────────────
+//  MOCK BACKEND  (localStorage)
+// ─────────────────────────────────────────────
+const DB = {
+  get: (k) => { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
+  set: (k, v) => localStorage.setItem(k, JSON.stringify(v)),
+  del: (k) => localStorage.removeItem(k),
+};
+
+function uuid() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
+
+/* --- Auth mock --- */
+const Auth = {
+  register(email, password) {
+    const users = DB.get('users') || {};
+    if (users[email]) throw new Error('Email already registered.');
+    const id = uuid();
+    users[email] = { id, email, password, created_at: new Date().toISOString() };
+    DB.set('users', users);
+    // create default profile
+    const profiles = DB.get('profiles') || {};
+    profiles[id] = { id: uuid(), user_id: id, major: '', interests: [], skills: [], experience_level: 'entry', savings: 0, updated_at: new Date().toISOString() };
+    DB.set('profiles', profiles);
+    DB.set('loans_' + id, []);
+    return { access_token: 'tok_' + id, refresh_token: 'ref_' + id, token_type: 'bearer', _uid: id };
+  },
+  login(email, password) {
+    const users = DB.get('users') || {};
+    const u = users[email];
+    if (!u || u.password !== password) throw new Error('Invalid credentials.');
+    return { access_token: 'tok_' + u.id, refresh_token: 'ref_' + u.id, token_type: 'bearer', _uid: u.id };
+  },
+  uidFromToken(tok) {
+    if (!tok || !tok.startsWith('tok_')) return null;
+    return tok.slice(4);
+  },
+};
+
+/* --- Profile mock --- */
+const ProfileAPI = {
+  get(uid) { const p = DB.get('profiles') || {}; return p[uid] || null; },
+  put(uid, patch) {
+    const p = DB.get('profiles') || {};
+    const cur = p[uid] || {};
+    p[uid] = { ...cur, ...patch, user_id: uid, updated_at: new Date().toISOString() };
+    DB.set('profiles', p);
+    return p[uid];
+  },
+};
+
+/* --- Loans mock --- */
+const LoansAPI = {
+  list(uid) { return DB.get('loans_' + uid) || []; },
+  create(uid, data) {
+    const loans = LoansAPI.list(uid);
+    const loan = { ...data, id: uuid(), user_id: uid, created_at: new Date().toISOString() };
+    loans.push(loan);
+    DB.set('loans_' + uid, loans);
+    return loan;
+  },
+  update(uid, id, data) {
+    const loans = LoansAPI.list(uid);
+    const idx = loans.findIndex(l => l.id === id);
+    if (idx === -1) throw new Error('Loan not found');
+    loans[idx] = { ...loans[idx], ...data };
+    DB.set('loans_' + uid, loans);
+    return loans[idx];
+  },
+  delete(uid, id) {
+    const loans = LoansAPI.list(uid).filter(l => l.id !== id);
+    DB.set('loans_' + uid, loans);
+  },
+};
+
+/* --- Debt projection (real math) --- */
+function computeTakeHome(annualSalary) {
+  // FICA 7.65%
+  const fica = Math.min(annualSalary, 168600) * 0.062 + annualSalary * 0.0145;
+  // 2024 brackets (standard deduction $14,600 already applied to taxable)
+  const taxable = Math.max(0, annualSalary - 14600);
+  let tax = 0;
+  const brackets = [[11600,0.10],[35550,0.12],[53375,0.22],[91425,0.24],[51775,0.32],[365625,0.35],[Infinity,0.37]];
+  let rem = taxable;
+  for (const [size, rate] of brackets) {
+    if (rem <= 0) break;
+    const chunk = Math.min(rem, size);
+    tax += chunk * rate;
+    rem -= chunk;
+  }
+  return (annualSalary - fica - tax) / 12;
+}
+
+function avalanche(loans, monthlyPayment) {
+  // deep copy
+  let lns = loans.map(l => ({ ...l, balance: +l.balance, rate: +l.annual_interest_rate, minPay: +l.minimum_monthly_payment }));
+  let months = 0, totalInterest = 0;
+  while (lns.some(l => l.balance > 0) && months < 600) {
+    months++;
+    // accrue interest + min payments
+    let surplus = monthlyPayment;
+    lns = lns.map(l => {
+      if (l.balance <= 0) return l;
+      const interest = l.balance * (l.rate / 12);
+      totalInterest += interest;
+      l.balance += interest;
+      const pay = Math.min(l.balance, l.minPay);
+      l.balance -= pay;
+      surplus -= pay;
+      return l;
+    });
+    surplus = Math.max(0, surplus);
+    // avalanche: pay highest-rate first
+    lns = [...lns].sort((a, b) => b.rate - a.rate);
+    for (let i = 0; i < lns.length && surplus > 0; i++) {
+      if (lns[i].balance <= 0) continue;
+      const pay = Math.min(lns[i].balance, surplus);
+      lns[i].balance -= pay;
+      surplus -= pay;
+    }
+    // balance can't go negative
+    lns = lns.map(l => ({ ...l, balance: Math.max(0, l.balance) }));
+  }
+  return { months, totalInterest };
+}
+
+function generateMockJobs(profile) {
+  const sources = ['linkedin','handshake','indeed','usajobs'];
+  const titles = ['Software Engineer','Data Analyst','Product Manager','UX Designer','Backend Developer','Frontend Developer','ML Engineer','DevOps Engineer','Business Analyst','Systems Engineer'];
+  const companies = ['Acme Corp','TechCo','DataSoft','BuildIt Inc','CloudBase','Nexus LLC','InnovateCo','BrightPath','CoreSystems','StackWorks'];
+  const locations = ['New York, NY','San Francisco, CA','Austin, TX','Chicago, IL','Remote','Seattle, WA','Boston, MA','Denver, CO'];
+  const jobs = [];
+  for (let i = 0; i < 12; i++) {
+    const fitScore = Math.floor(Math.random() * 100);
+    const tier = fitScore >= 70 ? 'high' : fitScore >= 40 ? 'mid' : 'low';
+    const salMin = Math.round((55000 + Math.random() * 80000) / 1000) * 1000;
+    const salMax = salMin + Math.round((10000 + Math.random() * 30000) / 1000) * 1000;
+    jobs.push({
+      id: uuid(),
+      job_title: titles[i % titles.length],
+      company: companies[i % companies.length],
+      location: locations[i % locations.length],
+      salary_min: salMin,
+      salary_max: salMax,
+      salary_median_est: Math.round((salMin + salMax) / 2),
+      source: sources[i % sources.length],
+      job_url: '#',
+      fit_score: fitScore,
+      tier,
+    });
+  }
+  return jobs;
+}
+
+const ResultsAPI = {
+  generate(uid, savingsRate) {
+    const profile = ProfileAPI.get(uid);
+    const loans = LoansAPI.list(uid);
+    const jobs = generateMockJobs(profile);
+    const tiers = ['high','mid','low'];
+    const medians = { high: 95000, mid: 72000, low: 52000 };
+    const result = { created_at: new Date().toISOString() };
+    for (const t of tiers) {
+      const tierJobs = jobs.filter(j => j.tier === t);
+      const salaries = tierJobs.map(j => j.salary_median_est || ((j.salary_min||0) + (j.salary_max||0)) / 2).filter(Boolean);
+      const salMin = salaries.length ? Math.min(...salaries) : medians[t] * 0.85;
+      const salMax = salaries.length ? Math.max(...salaries) : medians[t] * 1.15;
+      const median = medians[t];
+      const takeHome = computeTakeHome(median);
+      const monthlyPayment = takeHome * (savingsRate / 100);
+      const { months, totalInterest } = loans.length
+        ? avalanche(loans, monthlyPayment)
+        : { months: 0, totalInterest: 0 };
+      result[t + '_tier'] = {
+        jobs: tierJobs,
+        salary_stats: { min: salMin, max: salMax, median },
+        debt_projection: { months_to_payoff: months, total_interest_paid: Math.round(totalInterest), median_salary_used: median, savings_rate_pct: savingsRate },
+      };
+    }
+    DB.set('results_' + uid, result);
+    return result;
+  },
+  latest(uid) {
+    return DB.get('results_' + uid) || null;
+  },
+};
+
+// ─────────────────────────────────────────────
+//  REACT APP
+// ─────────────────────────────────────────────
+const { useState, useEffect, useCallback, useRef, createContext, useContext } = React;
+const { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Cell } = Recharts;
+
+// ── Auth Context ──────────────────────────────
+const AuthCtx = createContext(null);
+function AuthProvider({ children }) {
+  const [token, setToken] = useState(() => localStorage.getItem('access_token'));
+  const uid = Auth.uidFromToken(token);
+  function doLogin(tokens) {
+    localStorage.setItem('access_token', tokens.access_token);
+    localStorage.setItem('refresh_token', tokens.refresh_token);
+    setToken(tokens.access_token);
+  }
+  function doLogout() {
+    localStorage.removeItem('access_token');
+    localStorage.removeItem('refresh_token');
+    setToken(null);
+  }
+  return React.createElement(AuthCtx.Provider, { value: { token, uid, isAuthenticated: !!uid, login: doLogin, logout: doLogout } }, children);
+}
+function useAuth() { return useContext(AuthCtx); }
+
+// ── Simple Router ─────────────────────────────
+const RouteCtx = createContext({ path: '/', navigate: () => {} });
+function Router({ children }) {
+  const [path, setPath] = useState(() => window.location.pathname);
+  function navigate(to) {
+    window.history.pushState({}, '', to);
+    setPath(to);
+  }
+  useEffect(() => {
+    const handler = () => setPath(window.location.pathname);
+    window.addEventListener('popstate', handler);
+    return () => window.removeEventListener('popstate', handler);
+  }, []);
+  return React.createElement(RouteCtx.Provider, { value: { path, navigate } }, children);
+}
+function useNav() { return useContext(RouteCtx); }
+function Link({ to, children, className }) {
+  const { navigate } = useNav();
+  return React.createElement('a', {
+    href: to,
+    className,
+    onClick(e) { e.preventDefault(); navigate(to); },
+  }, children);
+}
+
+// ── Spinner SVG ────────────────────────────────
+function Spinner({ size = 4 }) {
+  return React.createElement('svg', { className: `spin h-${size} w-${size}`, viewBox: '0 0 24 24', fill: 'none' },
+    React.createElement('circle', { className: 'opacity-25', cx: 12, cy: 12, r: 10, stroke: 'currentColor', strokeWidth: 4 }),
+    React.createElement('path', { className: 'opacity-75', fill: 'currentColor', d: 'M4 12a8 8 0 018-8v8H4z' })
+  );
+}
+
+// ── Navbar ─────────────────────────────────────
+function Navbar() {
+  const { isAuthenticated, logout } = useAuth();
+  const { navigate } = useNav();
+  function handleLogout() { logout(); navigate('/'); }
+  return React.createElement('nav', { className: 'bg-white shadow-sm border-b border-gray-200' },
+    React.createElement('div', { className: 'max-w-5xl mx-auto px-6 py-3 flex items-center justify-between' },
+      React.createElement(Link, { to: '/', className: 'text-lg font-bold text-gray-900 hover:text-blue-600 transition-colors' }, 'CareerPath'),
+      React.createElement('div', { className: 'flex items-center gap-5 text-sm font-medium' },
+        isAuthenticated
+          ? React.createElement(React.Fragment, null,
+              React.createElement(Link, { to: '/profile', className: 'text-gray-600 hover:text-blue-600 transition-colors' }, 'Profile'),
+              React.createElement(Link, { to: '/results', className: 'text-gray-600 hover:text-blue-600 transition-colors' }, 'Results'),
+              React.createElement('button', { onClick: handleLogout, className: 'text-gray-600 hover:text-red-600 transition-colors' }, 'Logout')
+            )
+          : React.createElement(React.Fragment, null,
+              React.createElement(Link, { to: '/login', className: 'text-gray-600 hover:text-blue-600 transition-colors' }, 'Login'),
+              React.createElement(Link, { to: '/register', className: 'px-4 py-1.5 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors' }, 'Register')
+            )
+      )
+    )
+  );
+}
+
+// ── TagInput ───────────────────────────────────
+function TagInput({ tags, onChange, placeholder }) {
+  const [input, setInput] = useState('');
+  function addTag(raw) {
+    const val = raw.trim().replace(/,$/, '').trim();
+    if (val && !tags.includes(val)) onChange([...tags, val]);
+    setInput('');
+  }
+  function handleKey(e) {
+    if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); addTag(input); }
+    else if (e.key === 'Backspace' && input === '' && tags.length > 0) onChange(tags.slice(0, -1));
+  }
+  return React.createElement('div', { className: 'flex flex-wrap gap-1.5 items-center border border-gray-300 rounded-md px-2 py-1.5 bg-white focus-within:ring-2 focus-within:ring-blue-500' },
+    ...tags.map(tag =>
+      React.createElement('span', { key: tag, className: 'inline-flex items-center gap-1 bg-gray-100 text-gray-700 text-sm px-2 py-0.5 rounded-full' },
+        tag,
+        React.createElement('button', { type: 'button', onClick: () => onChange(tags.filter(t => t !== tag)), className: 'text-gray-400 hover:text-gray-600' }, '×')
+      )
+    ),
+    React.createElement('input', {
+      type: 'text', value: input,
+      onChange: e => setInput(e.target.value),
+      onKeyDown: handleKey,
+      onBlur: () => addTag(input),
+      placeholder: tags.length === 0 ? (placeholder || 'Add…') : '',
+      className: 'flex-1 min-w-28 outline-none text-sm bg-transparent placeholder-gray-400',
+    })
+  );
+}
+
+// ── FitBadge ───────────────────────────────────
+function FitBadge({ score }) {
+  const [cls, label] = score >= 70 ? ['bg-green-100 text-green-800','High Fit'] : score >= 40 ? ['bg-amber-100 text-amber-800','Mid Fit'] : ['bg-red-100 text-red-800','Low Fit'];
+  return React.createElement('span', { className: `inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${cls}` }, `${label} · ${score}`);
+}
+
+// ── SourceBadge ────────────────────────────────
+const SRC = { linkedin: { label: 'LinkedIn', bg: '#0077b5' }, handshake: { label: 'Handshake', bg: '#E05C82' }, indeed: { label: 'Indeed', bg: '#4338ca' }, usajobs: { label: 'USAJobs', bg: '#1e3a5f' } };
+function SourceBadge({ source }) {
+  const { label, bg } = SRC[source] || { label: source, bg: '#888' };
+  return React.createElement('span', { className: 'inline-block px-2 py-0.5 rounded-full text-xs font-medium', style: { backgroundColor: bg, color: '#fff' } }, label);
+}
+
+// ── JobCard ─────────────────────────────────────
+const fmtCur = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
+function JobCard({ job }) {
+  let salaryText = 'Salary not listed';
+  if (job.salary_min !== null && job.salary_max !== null) salaryText = `${fmtCur.format(job.salary_min)} – ${fmtCur.format(job.salary_max)}`;
+  else if (job.salary_min !== null) salaryText = `From ${fmtCur.format(job.salary_min)}`;
+  else if (job.salary_max !== null) salaryText = `Up to ${fmtCur.format(job.salary_max)}`;
+  return React.createElement('div', { className: 'bg-white rounded-lg shadow-sm border border-gray-100 p-4 flex flex-col gap-2' },
+    React.createElement('div', { className: 'flex items-center justify-between gap-2' },
+      React.createElement(FitBadge, { score: job.fit_score }),
+      React.createElement(SourceBadge, { source: job.source })
+    ),
+    React.createElement('div', null,
+      React.createElement('p', { className: 'font-semibold text-gray-900 text-sm leading-snug' }, job.job_title),
+      React.createElement('p', { className: 'text-gray-500 text-xs mt-0.5' }, `${job.company} · ${job.location}`)
+    ),
+    React.createElement('p', { className: 'text-gray-700 text-xs font-medium' }, salaryText),
+    job.job_url && job.job_url !== '#' && React.createElement('a', { href: job.job_url, target: '_blank', rel: 'noopener noreferrer', className: 'text-blue-600 hover:text-blue-700 text-xs font-medium' }, 'View Listing ↗')
+  );
+}
+
+// ── TierColumn ─────────────────────────────────
+const TIER_COLORS_MAP = {
+  green: { dot: 'bg-green-500', text: 'text-green-700', border: 'border-green-200' },
+  amber: { dot: 'bg-amber-500', text: 'text-amber-700', border: 'border-amber-200' },
+  red: { dot: 'bg-red-500', text: 'text-red-700', border: 'border-red-200' },
+};
+function TierColumn({ tier, color, label }) {
+  const c = TIER_COLORS_MAP[color];
+  const { jobs, salary_stats } = tier;
+  const hasSal = salary_stats.min > 0 && salary_stats.max > 0;
+  return React.createElement('div', { className: `flex flex-col gap-3 rounded-xl border ${c.border} bg-gray-50 p-4` },
+    React.createElement('div', { className: 'flex items-center gap-2' },
+      React.createElement('span', { className: `w-3 h-3 rounded-full flex-shrink-0 ${c.dot}` }),
+      React.createElement('h2', { className: `font-bold text-base ${c.text}` }, label)
+    ),
+    React.createElement('div', { className: 'text-xs text-gray-600 space-y-0.5' },
+      React.createElement('p', null, React.createElement('span', { className: 'font-medium text-gray-800' }, jobs.length), ` ${jobs.length === 1 ? 'job' : 'jobs'}`),
+      hasSal && React.createElement(React.Fragment, null,
+        React.createElement('p', null, 'Range: ', React.createElement('span', { className: 'font-medium text-gray-800' }, `${fmtCur.format(salary_stats.min)} – ${fmtCur.format(salary_stats.max)}`)),
+        React.createElement('p', null, 'Median: ', React.createElement('span', { className: 'font-medium text-gray-800' }, fmtCur.format(salary_stats.median)))
+      )
+    ),
+    React.createElement('div', { className: 'flex flex-col gap-2 overflow-y-auto pr-0.5', style: { maxHeight: '60vh' } },
+      jobs.length === 0
+        ? React.createElement('p', { className: 'text-gray-400 text-sm text-center py-6' }, 'No jobs in this tier')
+        : jobs.map(job => React.createElement(JobCard, { key: job.id, job }))
+    )
+  );
+}
+
+// ── LoanProjectionComparison ────────────────────
+function formatMonths(m) {
+  if (!m) return '—';
+  if (m < 12) return `${m} mo`;
+  const y = Math.floor(m / 12), r = m % 12;
+  return r === 0 ? `${y} yr` : `${y} yr ${r} mo`;
+}
+function TierCard({ label, projection, speedRank }) {
+  const bg = speedRank === 'fastest' ? 'bg-green-50 border-green-200' : speedRank === 'slowest' ? 'bg-red-50 border-red-200' : 'bg-amber-50 border-amber-200';
+  const head = speedRank === 'fastest' ? 'text-green-700' : speedRank === 'slowest' ? 'text-red-700' : 'text-amber-700';
+  const mo = speedRank === 'fastest' ? 'text-green-800' : speedRank === 'slowest' ? 'text-red-800' : 'text-amber-800';
+  return React.createElement('div', { className: `flex-1 rounded-xl border p-5 flex flex-col gap-3 ${bg}` },
+    React.createElement('h3', { className: `font-bold text-sm ${head}` }, label),
+    React.createElement('div', { className: 'space-y-1 text-xs text-gray-600' },
+      React.createElement('p', null, 'Salary used: ', React.createElement('span', { className: 'font-medium text-gray-800' }, `${fmtCur.format(projection.median_salary_used)}/yr`)),
+      React.createElement('p', null, 'Savings rate: ', React.createElement('span', { className: 'font-medium text-gray-800' }, `${projection.savings_rate_pct}%`))
+    ),
+    React.createElement('div', { className: 'mt-1' },
+      React.createElement('p', { className: 'text-xs text-gray-500 uppercase tracking-wide font-medium' }, 'Months to pay off'),
+      React.createElement('p', { className: `text-3xl font-extrabold leading-tight mt-0.5 ${mo}` }, formatMonths(projection.months_to_payoff))
+    ),
+    React.createElement('div', null,
+      React.createElement('p', { className: 'text-xs text-gray-500 uppercase tracking-wide font-medium' }, 'Total interest'),
+      React.createElement('p', { className: 'text-lg font-bold text-gray-800 mt-0.5' }, fmtCur.format(projection.total_interest_paid))
+    )
+  );
+}
+function LoanProjectionComparison({ high, mid, low }) {
+  const tiers = [{ label: 'High Fit', p: high }, { label: 'Mid Fit', p: mid }, { label: 'Low Fit', p: low }];
+  const months = [high.months_to_payoff, mid.months_to_payoff, low.months_to_payoff];
+  const minM = Math.min(...months), maxM = Math.max(...months);
+  function rank(p) { return p.months_to_payoff === minM ? 'fastest' : p.months_to_payoff === maxM ? 'slowest' : 'middle'; }
+  return React.createElement('div', { className: 'flex flex-col sm:flex-row gap-4' },
+    ...tiers.map(({ label, p }) => React.createElement(TierCard, { key: label, label, projection: p, speedRank: rank(p) }))
+  );
+}
+
+// ── PayoffChart ─────────────────────────────────
+const TIER_CHART_COLORS = ['#22c55e', '#f59e0b', '#ef4444'];
+function PayoffChart({ high, mid, low }) {
+  const data = [
+    { tier: 'High Fit', months: high.months_to_payoff },
+    { tier: 'Mid Fit', months: mid.months_to_payoff },
+    { tier: 'Low Fit', months: low.months_to_payoff },
+  ];
+  return React.createElement('div', { className: 'bg-white rounded-xl border border-gray-200 p-5' },
+    React.createElement('p', { className: 'text-sm font-semibold text-gray-700 mb-4' }, 'Months to Pay Off Student Loans by Job Tier'),
+    React.createElement(ResponsiveContainer, { width: '100%', height: 280 },
+      React.createElement(BarChart, { data, margin: { top: 8, right: 16, bottom: 8, left: 0 } },
+        React.createElement(CartesianGrid, { strokeDasharray: '3 3', vertical: false, stroke: '#e5e7eb' }),
+        React.createElement(XAxis, { dataKey: 'tier', tick: { fontSize: 12, fill: '#6b7280' }, axisLine: false, tickLine: false }),
+        React.createElement(YAxis, { tick: { fontSize: 12, fill: '#6b7280' }, axisLine: false, tickLine: false }),
+        React.createElement(Tooltip, { formatter: v => [`${v} months`, 'Payoff time'], contentStyle: { fontSize: 12, borderRadius: 8, border: '1px solid #e5e7eb' } }),
+        React.createElement(Bar, { dataKey: 'months', radius: [6,6,0,0] },
+          ...data.map((_,i) => React.createElement(Cell, { key: i, fill: TIER_CHART_COLORS[i] }))
+        )
+      )
+    )
+  );
+}
+
+// ── SavingsRateSlider ──────────────────────────
+function SavingsRateSlider({ value, onChange, monthlyTakeHome }) {
+  const pmt = monthlyTakeHome * (value / 100);
+  return React.createElement('div', { className: 'bg-white rounded-xl border border-gray-200 p-5' },
+    React.createElement('div', { className: 'flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1 mb-3' },
+      React.createElement('label', { className: 'text-sm font-semibold text-gray-700' }, 'Savings Rate'),
+      React.createElement('span', { className: 'text-sm text-gray-500' },
+        'Saving ', React.createElement('span', { className: 'font-bold text-gray-800' }, `${value}%`),
+        ' of take-home pay ≈ ', React.createElement('span', { className: 'font-bold text-gray-800' }, `${fmtCur.format(pmt)}/mo`)
+      )
+    ),
+    React.createElement('input', { type: 'range', min: 5, max: 50, step: 1, value, onChange: e => onChange(+e.target.value), className: 'w-full cursor-pointer' }),
+    React.createElement('div', { className: 'flex justify-between text-xs text-gray-400 mt-1' },
+      React.createElement('span', null, '5%'),
+      React.createElement('span', null, '50%')
+    )
+  );
+}
+
+// ── LoanCard ────────────────────────────────────
+const LOAN_LABELS = { federal_subsidized: 'Federal Subsidized', federal_unsubsidized: 'Federal Unsubsidized', federal_grad_plus: 'Federal Grad PLUS', private: 'Private' };
+function LoanCard({ loan, onUpdate, onDelete }) {
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState({ label: loan.label, loan_type: loan.loan_type, balance: loan.balance, rate_pct: +(loan.annual_interest_rate * 100).toFixed(4), minimum_monthly_payment: loan.minimum_monthly_payment });
+  function handleSave() {
+    onUpdate(loan.id, { label: form.label, loan_type: form.loan_type, balance: +form.balance, annual_interest_rate: +form.rate_pct / 100, minimum_monthly_payment: +form.minimum_monthly_payment });
+    setEditing(false);
+  }
+  function handleDelete() { if (window.confirm(`Delete loan "${loan.label}"?`)) onDelete(loan.id); }
+  const inputCls = 'w-full border border-gray-300 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500';
+  if (editing) {
+    return React.createElement('div', { className: 'bg-white border border-blue-300 rounded-lg p-4 space-y-3' },
+      React.createElement('div', { className: 'grid grid-cols-1 sm:grid-cols-2 gap-3' },
+        React.createElement('div', null, React.createElement('label', { className: 'block text-xs font-medium text-gray-600 mb-1' }, 'Label'), React.createElement('input', { type: 'text', value: form.label, onChange: e => setForm({ ...form, label: e.target.value }), className: inputCls })),
+        React.createElement('div', null, React.createElement('label', { className: 'block text-xs font-medium text-gray-600 mb-1' }, 'Type'),
+          React.createElement('select', { value: form.loan_type, onChange: e => setForm({ ...form, loan_type: e.target.value }), className: inputCls },
+            ...Object.entries(LOAN_LABELS).map(([v,l]) => React.createElement('option', { key: v, value: v }, l))
+          )
+        ),
+        React.createElement('div', null, React.createElement('label', { className: 'block text-xs font-medium text-gray-600 mb-1' }, 'Balance ($)'), React.createElement('input', { type: 'number', min: 0, step: 0.01, value: form.balance, onChange: e => setForm({ ...form, balance: e.target.value }), className: inputCls })),
+        React.createElement('div', null, React.createElement('label', { className: 'block text-xs font-medium text-gray-600 mb-1' }, 'Annual Rate (%)'), React.createElement('input', { type: 'number', min: 0, step: 0.01, value: form.rate_pct, onChange: e => setForm({ ...form, rate_pct: e.target.value }), className: inputCls })),
+        React.createElement('div', null, React.createElement('label', { className: 'block text-xs font-medium text-gray-600 mb-1' }, 'Min Payment ($)'), React.createElement('input', { type: 'number', min: 0, step: 0.01, value: form.minimum_monthly_payment, onChange: e => setForm({ ...form, minimum_monthly_payment: e.target.value }), className: inputCls }))
+      ),
+      React.createElement('div', { className: 'flex gap-2' },
+        React.createElement('button', { onClick: handleSave, className: 'px-4 py-1.5 bg-blue-600 text-white text-sm rounded-md hover:bg-blue-700' }, 'Save'),
+        React.createElement('button', { onClick: () => setEditing(false), className: 'px-4 py-1.5 border border-gray-300 text-gray-600 text-sm rounded-md hover:border-gray-400' }, 'Cancel')
+      )
+    );
+  }
+  return React.createElement('div', { className: 'bg-white border border-gray-200 rounded-lg p-4 flex items-start justify-between gap-4' },
+    React.createElement('div', { className: 'space-y-1 flex-1' },
+      React.createElement('div', { className: 'flex items-center gap-2 flex-wrap' },
+        React.createElement('span', { className: 'font-medium text-gray-900 text-sm' }, loan.label),
+        React.createElement('span', { className: 'px-2 py-0.5 bg-blue-50 text-blue-700 text-xs rounded-full font-medium' }, LOAN_LABELS[loan.loan_type])
+      ),
+      React.createElement('div', { className: 'flex gap-4 text-sm text-gray-600 flex-wrap' },
+        React.createElement('span', null, 'Balance: ', React.createElement('span', { className: 'font-medium text-gray-900' }, `$${loan.balance.toLocaleString()}`)),
+        React.createElement('span', null, 'Rate: ', React.createElement('span', { className: 'font-medium text-gray-900' }, `${(loan.annual_interest_rate * 100).toFixed(2)}%`)),
+        React.createElement('span', null, 'Min: ', React.createElement('span', { className: 'font-medium text-gray-900' }, `$${loan.minimum_monthly_payment.toLocaleString()}/mo`))
+      )
+    ),
+    React.createElement('div', { className: 'flex gap-2 shrink-0' },
+      React.createElement('button', { onClick: () => setEditing(true), className: 'px-3 py-1.5 border border-gray-300 text-gray-600 text-xs rounded-md hover:border-gray-400' }, 'Edit'),
+      React.createElement('button', { onClick: handleDelete, className: 'px-3 py-1.5 border border-red-200 text-red-600 text-xs rounded-md hover:bg-red-50' }, 'Delete')
+    )
+  );
+}
+
+// ── LoanList ────────────────────────────────────
+const EMPTY_FORM = { label: '', loan_type: 'federal_subsidized', balance: '', rate_pct: '', minimum_monthly_payment: '' };
+function LoanList({ loans, onAdd, onUpdate, onDelete }) {
+  const [adding, setAdding] = useState(false);
+  const [form, setForm] = useState(EMPTY_FORM);
+  const inputCls = 'w-full border border-gray-300 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500';
+  function handleAdd() {
+    if (!form.label || !form.balance || !form.rate_pct || !form.minimum_monthly_payment) return;
+    onAdd({ label: form.label, loan_type: form.loan_type, balance: +form.balance, annual_interest_rate: +form.rate_pct / 100, minimum_monthly_payment: +form.minimum_monthly_payment });
+    setForm(EMPTY_FORM);
+    setAdding(false);
+  }
+  return React.createElement('div', { className: 'space-y-3' },
+    ...loans.map(loan => React.createElement(LoanCard, { key: loan.id, loan, onUpdate, onDelete })),
+    adding
+      ? React.createElement('div', { className: 'bg-white border border-blue-300 rounded-lg p-4 space-y-3' },
+          React.createElement('h4', { className: 'text-sm font-semibold text-gray-800' }, 'New Student Loan'),
+          React.createElement('div', { className: 'grid grid-cols-1 sm:grid-cols-2 gap-3' },
+            React.createElement('div', null, React.createElement('label', { className: 'block text-xs font-medium text-gray-600 mb-1' }, 'Label'), React.createElement('input', { type: 'text', value: form.label, onChange: e => setForm({ ...form, label: e.target.value }), placeholder: 'e.g. Federal Direct Subsidized', className: inputCls })),
+            React.createElement('div', null, React.createElement('label', { className: 'block text-xs font-medium text-gray-600 mb-1' }, 'Type'),
+              React.createElement('select', { value: form.loan_type, onChange: e => setForm({ ...form, loan_type: e.target.value }), className: inputCls },
+                ...Object.entries(LOAN_LABELS).map(([v,l]) => React.createElement('option', { key: v, value: v }, l))
+              )
+            ),
+            React.createElement('div', null, React.createElement('label', { className: 'block text-xs font-medium text-gray-600 mb-1' }, 'Balance ($)'), React.createElement('input', { type: 'number', min: 0, step: 0.01, value: form.balance, onChange: e => setForm({ ...form, balance: e.target.value }), placeholder: '25000', className: inputCls })),
+            React.createElement('div', null, React.createElement('label', { className: 'block text-xs font-medium text-gray-600 mb-1' }, 'Annual Rate (%)'), React.createElement('input', { type: 'number', min: 0, step: 0.01, value: form.rate_pct, onChange: e => setForm({ ...form, rate_pct: e.target.value }), placeholder: '5.5', className: inputCls })),
+            React.createElement('div', null, React.createElement('label', { className: 'block text-xs font-medium text-gray-600 mb-1' }, 'Min Payment ($)'), React.createElement('input', { type: 'number', min: 0, step: 0.01, value: form.minimum_monthly_payment, onChange: e => setForm({ ...form, minimum_monthly_payment: e.target.value }), placeholder: '200', className: inputCls }))
+          ),
+          React.createElement('div', { className: 'flex gap-2' },
+            React.createElement('button', { onClick: handleAdd, className: 'px-4 py-1.5 bg-blue-600 text-white text-sm rounded-md hover:bg-blue-700' }, 'Add'),
+            React.createElement('button', { onClick: () => { setAdding(false); setForm(EMPTY_FORM); }, className: 'px-4 py-1.5 border border-gray-300 text-gray-600 text-sm rounded-md hover:border-gray-400' }, 'Cancel')
+          )
+        )
+      : React.createElement('button', { onClick: () => setAdding(true), className: 'w-full py-2.5 border-2 border-dashed border-gray-300 text-gray-500 text-sm rounded-lg hover:border-blue-400 hover:text-blue-600 transition-colors' }, '+ Add Student Loan')
+  );
+}
+
+// ── ResumeUpload (mock — no server needed) ──────
+function ResumeUpload({ onExtracted }) {
+  const [done, setDone] = useState(false);
+  const [fileName, setFileName] = useState('');
+  const [dragging, setDragging] = useState(false);
+  const ref = useRef(null);
+  function process(file) {
+    if (!file.name.match(/\.(pdf|docx)$/i)) { alert('Only .pdf and .docx files are supported.'); return; }
+    // In browser-only mode we can't extract text, so we use the filename as a hint
+    setFileName(file.name);
+    setDone(true);
+    onExtracted(`Resume: ${file.name}`);
+  }
+  return React.createElement('div', {
+    onDragOver: e => { e.preventDefault(); setDragging(true); },
+    onDragLeave: () => setDragging(false),
+    onDrop: e => { e.preventDefault(); setDragging(false); const f = e.dataTransfer.files?.[0]; if (f) process(f); },
+    className: `border-2 border-dashed rounded-lg p-6 text-center transition-colors ${dragging ? 'border-blue-400 bg-blue-50' : 'border-gray-300 bg-white'}`,
+  },
+    done
+      ? React.createElement('div', { className: 'flex flex-col items-center gap-1 text-green-700' },
+          React.createElement('span', { className: 'text-2xl' }, '✓'),
+          React.createElement('span', { className: 'text-sm font-medium' }, 'Resume attached'),
+          React.createElement('span', { className: 'text-xs text-gray-500' }, fileName),
+          React.createElement('button', { onClick: () => { setDone(false); setFileName(''); if (ref.current) ref.current.value = ''; }, className: 'mt-1 text-xs text-blue-600 hover:underline' }, 'Upload a different file')
+        )
+      : React.createElement('div', { className: 'flex flex-col items-center gap-2' },
+          React.createElement('p', { className: 'text-sm text-gray-500' },
+            'Drag & drop your resume here, or ',
+            React.createElement('button', { type: 'button', onClick: () => ref.current?.click(), className: 'text-blue-600 hover:underline font-medium' }, 'browse')
+          ),
+          React.createElement('p', { className: 'text-xs text-gray-400' }, 'PDF or DOCX only')
+        ),
+    React.createElement('input', { ref, type: 'file', accept: '.pdf,.docx', onChange: e => { const f = e.target.files?.[0]; if (f) process(f); }, className: 'hidden' })
+  );
+}
+
+// ─────────────────────────────────────────────
+//  PAGES
+// ─────────────────────────────────────────────
+
+// ── Home Page ─────────────────────────────────
+function HomePage() {
+  const { isAuthenticated } = useAuth();
+  const { navigate } = useNav();
+  if (isAuthenticated) { navigate('/profile'); return null; }
+  return React.createElement('div', { className: 'min-h-screen bg-gray-50' },
+    React.createElement('header', { className: 'bg-white border-b border-gray-200' },
+      React.createElement('div', { className: 'max-w-5xl mx-auto px-6 py-4 flex items-center justify-between' },
+        React.createElement('h1', { className: 'text-xl font-bold text-gray-900' }, 'Career & Debt Planner'),
+        React.createElement('nav', { className: 'flex gap-6 text-sm font-medium text-gray-600' },
+          React.createElement(Link, { to: '/login', className: 'hover:text-blue-600 transition-colors' }, 'Log In'),
+          React.createElement(Link, { to: '/register', className: 'hover:text-blue-600 transition-colors' }, 'Register')
+        )
+      )
+    ),
+    React.createElement('main', { className: 'max-w-5xl mx-auto px-6 py-20 text-center' },
+      React.createElement('h2', { className: 'text-4xl font-extrabold text-gray-900 mb-4' }, 'Find jobs. See your payoff date.'),
+      React.createElement('p', { className: 'text-lg text-gray-600 max-w-2xl mx-auto mb-8' }, "Enter your profile, upload your resume, and we'll match you to US job opportunities while projecting exactly how long it'll take to pay off your student loans at each salary tier."),
+      React.createElement('div', { className: 'flex justify-center gap-4' },
+        React.createElement(Link, { to: '/register', className: 'px-6 py-3 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 transition-colors' }, 'Get Started'),
+        React.createElement(Link, { to: '/login', className: 'px-6 py-3 border border-gray-300 text-gray-700 rounded-lg font-semibold hover:border-gray-400 transition-colors' }, 'Log In')
+      )
+    ),
+    React.createElement('section', { className: 'max-w-5xl mx-auto px-6 pb-20 grid grid-cols-1 md:grid-cols-3 gap-6' },
+      ...[
+        { title: 'Profile & Loans', desc: 'Enter your major, skills, and student loan details.' },
+        { title: 'Job Matching', desc: 'We search LinkedIn, Handshake, Indeed, and USAJobs.' },
+        { title: 'Payoff Projection', desc: 'See months to debt-free at High, Mid, and Low salary tiers.' },
+      ].map(c => React.createElement('div', { key: c.title, className: 'bg-white rounded-xl border border-gray-200 p-6' },
+        React.createElement('h3', { className: 'font-semibold text-gray-900 mb-2' }, c.title),
+        React.createElement('p', { className: 'text-sm text-gray-500' }, c.desc)
+      ))
+    )
+  );
+}
+
+// ── Login Page ────────────────────────────────
+function LoginPage() {
+  const { login: saveTokens } = useAuth();
+  const { navigate } = useNav();
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [errors, setErrors] = useState({});
+  const [apiError, setApiError] = useState(null);
+  const [loading, setLoading] = useState(false);
+  function validate() {
+    const e = {};
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) e.email = 'Enter a valid email.';
+    if (password.length < 8) e.password = 'Password must be at least 8 characters.';
+    return e;
+  }
+  function handleSubmit(ev) {
+    ev.preventDefault();
+    const errs = validate(); setErrors(errs);
+    if (Object.keys(errs).length) return;
+    setLoading(true); setApiError(null);
+    try {
+      const tokens = Auth.login(email, password);
+      saveTokens(tokens);
+      navigate('/profile');
+    } catch (err) {
+      setApiError(err.message || 'Login failed.');
+    } finally {
+      setLoading(false);
+    }
+  }
+  const fieldCls = (k) => `w-full border rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 ${errors[k] ? 'border-red-400' : 'border-gray-300'}`;
+  return React.createElement('div', { className: 'min-h-screen bg-gray-50 flex items-center justify-center px-4' },
+    React.createElement('div', { className: 'w-full max-w-md bg-white rounded-xl border border-gray-200 p-8 shadow-sm' },
+      React.createElement('h1', { className: 'text-2xl font-bold text-gray-900 mb-1' }, 'Welcome back'),
+      React.createElement('p', { className: 'text-sm text-gray-500 mb-6' }, 'Log in to your CareerPath account.'),
+      apiError && React.createElement('div', { className: 'mb-4 px-4 py-3 bg-red-50 border border-red-200 rounded-md text-sm text-red-700' }, apiError),
+      React.createElement('form', { onSubmit: handleSubmit, className: 'space-y-4' },
+        React.createElement('div', null,
+          React.createElement('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, 'Email'),
+          React.createElement('input', { type: 'email', value: email, onChange: e => setEmail(e.target.value), autoComplete: 'email', className: fieldCls('email') }),
+          errors.email && React.createElement('p', { className: 'mt-1 text-xs text-red-600' }, errors.email)
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, 'Password'),
+          React.createElement('input', { type: 'password', value: password, onChange: e => setPassword(e.target.value), autoComplete: 'current-password', className: fieldCls('password') }),
+          errors.password && React.createElement('p', { className: 'mt-1 text-xs text-red-600' }, errors.password)
+        ),
+        React.createElement('button', { type: 'submit', disabled: loading, className: 'w-full py-2.5 bg-blue-600 text-white text-sm font-semibold rounded-md hover:bg-blue-700 disabled:opacity-50' },
+          loading ? 'Logging in…' : 'Log In'
+        )
+      ),
+      React.createElement('p', { className: 'mt-5 text-center text-sm text-gray-500' },
+        "Don't have an account? ",
+        React.createElement(Link, { to: '/register', className: 'text-blue-600 hover:underline font-medium' }, 'Register')
+      )
+    )
+  );
+}
+
+// ── Register Page ─────────────────────────────
+function RegisterPage() {
+  const { login: saveTokens } = useAuth();
+  const { navigate } = useNav();
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [errors, setErrors] = useState({});
+  const [apiError, setApiError] = useState(null);
+  const [loading, setLoading] = useState(false);
+  function validate() {
+    const e = {};
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) e.email = 'Enter a valid email.';
+    if (password.length < 8) e.password = 'Password must be at least 8 characters.';
+    if (password !== confirm) e.confirm = 'Passwords do not match.';
+    return e;
+  }
+  function handleSubmit(ev) {
+    ev.preventDefault();
+    const errs = validate(); setErrors(errs);
+    if (Object.keys(errs).length) return;
+    setLoading(true); setApiError(null);
+    try {
+      const tokens = Auth.register(email, password);
+      saveTokens(tokens);
+      navigate('/profile');
+    } catch (err) {
+      setApiError(err.message || 'Registration failed.');
+    } finally {
+      setLoading(false);
+    }
+  }
+  const fieldCls = (k) => `w-full border rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 ${errors[k] ? 'border-red-400' : 'border-gray-300'}`;
+  return React.createElement('div', { className: 'min-h-screen bg-gray-50 flex items-center justify-center px-4' },
+    React.createElement('div', { className: 'w-full max-w-md bg-white rounded-xl border border-gray-200 p-8 shadow-sm' },
+      React.createElement('h1', { className: 'text-2xl font-bold text-gray-900 mb-1' }, 'Create an account'),
+      React.createElement('p', { className: 'text-sm text-gray-500 mb-6' }, 'Start planning your career and debt payoff today.'),
+      apiError && React.createElement('div', { className: 'mb-4 px-4 py-3 bg-red-50 border border-red-200 rounded-md text-sm text-red-700' }, apiError),
+      React.createElement('form', { onSubmit: handleSubmit, className: 'space-y-4' },
+        React.createElement('div', null,
+          React.createElement('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, 'Email'),
+          React.createElement('input', { type: 'email', value: email, onChange: e => setEmail(e.target.value), autoComplete: 'email', className: fieldCls('email') }),
+          errors.email && React.createElement('p', { className: 'mt-1 text-xs text-red-600' }, errors.email)
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, 'Password'),
+          React.createElement('input', { type: 'password', value: password, onChange: e => setPassword(e.target.value), autoComplete: 'new-password', className: fieldCls('password') }),
+          errors.password && React.createElement('p', { className: 'mt-1 text-xs text-red-600' }, errors.password)
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, 'Confirm Password'),
+          React.createElement('input', { type: 'password', value: confirm, onChange: e => setConfirm(e.target.value), autoComplete: 'new-password', className: fieldCls('confirm') }),
+          errors.confirm && React.createElement('p', { className: 'mt-1 text-xs text-red-600' }, errors.confirm)
+        ),
+        React.createElement('button', { type: 'submit', disabled: loading, className: 'w-full py-2.5 bg-blue-600 text-white text-sm font-semibold rounded-md hover:bg-blue-700 disabled:opacity-50' },
+          loading ? 'Creating account…' : 'Create Account'
+        )
+      ),
+      React.createElement('p', { className: 'mt-5 text-center text-sm text-gray-500' },
+        'Already have an account? ',
+        React.createElement(Link, { to: '/login', className: 'text-blue-600 hover:underline font-medium' }, 'Log In')
+      )
+    )
+  );
+}
+
+// ── Profile Page ──────────────────────────────
+function ProfilePage() {
+  const { uid } = useAuth();
+  const { navigate } = useNav();
+  const [profile, setProfile] = useState(null);
+  const [loans, setLoans] = useState([]);
+  const [resumeText, setResumeText] = useState('');
+  const [generating, setGenerating] = useState(false);
+  const [genError, setGenError] = useState(null);
+
+  useEffect(() => {
+    const p = ProfileAPI.get(uid);
+    const l = LoansAPI.list(uid);
+    setProfile(p || { id: uuid(), user_id: uid, major: '', interests: [], skills: [], experience_level: 'entry', savings: 0, updated_at: new Date().toISOString() });
+    setLoans(l);
+  }, [uid]);
+
+  function updateField(key, value) {
+    if (!profile) return;
+    const patch = { ...profile, [key]: value };
+    setProfile(patch);
+    ProfileAPI.put(uid, { [key]: value });
+  }
+
+  function handleAddLoan(data) {
+    const loan = LoansAPI.create(uid, data);
+    setLoans(prev => [...prev, loan]);
+  }
+  function handleUpdateLoan(id, data) {
+    const loan = LoansAPI.update(uid, id, data);
+    setLoans(prev => prev.map(l => l.id === id ? loan : l));
+  }
+  function handleDeleteLoan(id) {
+    LoansAPI.delete(uid, id);
+    setLoans(prev => prev.filter(l => l.id !== id));
+  }
+
+  function handleGenerate() {
+    setGenerating(true); setGenError(null);
+    try {
+      ProfileAPI.put(uid, profile);
+      ResultsAPI.generate(uid, 20);
+      navigate('/results');
+    } catch {
+      setGenError('Failed to generate results. Please try again.');
+      setGenerating(false);
+    }
+  }
+
+  if (!profile) return React.createElement('div', { className: 'min-h-screen bg-gray-50' }, React.createElement(Navbar), React.createElement('div', { className: 'max-w-2xl mx-auto px-6 py-20 text-center text-gray-400 text-sm' }, 'Loading…'));
+
+  const inputCls = 'w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500';
+  return React.createElement('div', { className: 'min-h-screen bg-gray-50' },
+    React.createElement(Navbar),
+    React.createElement('main', { className: 'max-w-2xl mx-auto px-6 py-10 space-y-8' },
+      React.createElement('div', null,
+        React.createElement('h1', { className: 'text-2xl font-bold text-gray-900' }, 'Your Profile'),
+        React.createElement('p', { className: 'text-sm text-gray-500 mt-1' }, 'Fill in your details and loans, then click "Find My Jobs" to see results.')
+      ),
+
+      // About You
+      React.createElement('section', { className: 'bg-white rounded-xl border border-gray-200 p-6 space-y-5' },
+        React.createElement('h2', { className: 'text-base font-semibold text-gray-800' }, 'About You'),
+        React.createElement('div', null,
+          React.createElement('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, 'Major'),
+          React.createElement('input', { type: 'text', value: profile.major, onChange: e => updateField('major', e.target.value), placeholder: 'e.g. Computer Science', className: inputCls })
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, 'Interests'),
+          React.createElement(TagInput, { tags: profile.interests, onChange: tags => updateField('interests', tags), placeholder: 'Add interest and press Enter…' }),
+          React.createElement('p', { className: 'text-xs text-gray-400 mt-1' }, 'Press Enter or comma to add each interest.')
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, 'Skills'),
+          React.createElement(TagInput, { tags: profile.skills, onChange: tags => updateField('skills', tags), placeholder: 'Add skill and press Enter…' }),
+          React.createElement('p', { className: 'text-xs text-gray-400 mt-1' }, 'Press Enter or comma to add each skill.')
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, 'Experience Level'),
+          React.createElement('select', { value: profile.experience_level, onChange: e => updateField('experience_level', e.target.value), className: inputCls },
+            React.createElement('option', { value: 'entry' }, 'Entry Level'),
+            React.createElement('option', { value: 'mid' }, 'Mid Level'),
+            React.createElement('option', { value: 'senior' }, 'Senior Level')
+          )
+        ),
+        React.createElement('div', null,
+          React.createElement('label', { className: 'block text-sm font-medium text-gray-700 mb-1' }, 'Current Savings'),
+          React.createElement('div', { className: 'relative' },
+            React.createElement('span', { className: 'absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm' }, '$'),
+            React.createElement('input', { type: 'number', min: 0, step: 100, value: profile.savings, onChange: e => updateField('savings', parseFloat(e.target.value)||0), className: 'w-full border border-gray-300 rounded-md pl-7 pr-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500' })
+          )
+        )
+      ),
+
+      // Resume
+      React.createElement('section', { className: 'bg-white rounded-xl border border-gray-200 p-6 space-y-3' },
+        React.createElement('div', null,
+          React.createElement('h2', { className: 'text-base font-semibold text-gray-800' }, 'Your Resume'),
+          React.createElement('p', { className: 'text-sm text-gray-500 mt-0.5' }, 'Optional — uploading your resume improves job match quality.')
+        ),
+        React.createElement(ResumeUpload, { onExtracted: setResumeText })
+      ),
+
+      // Student Loans
+      React.createElement('section', { className: 'bg-white rounded-xl border border-gray-200 p-6 space-y-4' },
+        React.createElement('div', null,
+          React.createElement('h2', { className: 'text-base font-semibold text-gray-800' }, 'Your Student Loans'),
+          React.createElement('p', { className: 'text-sm text-gray-500 mt-0.5' }, 'Add each loan to calculate your payoff timeline across salary tiers.')
+        ),
+        React.createElement(LoanList, { loans, onAdd: handleAddLoan, onUpdate: handleUpdateLoan, onDelete: handleDeleteLoan })
+      ),
+
+      // Generate
+      genError && React.createElement('p', { className: 'text-sm text-red-600 text-center' }, genError),
+      React.createElement('button', {
+        onClick: handleGenerate,
+        disabled: generating,
+        className: 'w-full py-3 bg-green-600 text-white font-semibold rounded-lg hover:bg-green-700 disabled:opacity-50 transition-colors text-sm',
+      },
+        generating
+          ? React.createElement('span', { className: 'flex items-center justify-center gap-2' }, React.createElement(Spinner), 'Finding jobs…')
+          : 'Find My Jobs →'
+      )
+    )
+  );
+}
+
+// ── Results Page ─────────────────────────────
+function ResultsPage() {
+  const { uid } = useAuth();
+  const { navigate } = useNav();
+  const [results, setResults] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [savingsRate, setSavingsRate] = useState(20);
+  const [isRegenerating, setIsRegenerating] = useState(false);
+  const debounceRef = useRef(null);
+
+  useEffect(() => {
+    const r = ResultsAPI.latest(uid);
+    if (!r) { navigate('/profile'); return; }
+    setResults(r);
+    setIsLoading(false);
+  }, [uid]);
+
+  const isFirstRender = useRef(true);
+  useEffect(() => {
+    if (isFirstRender.current) { isFirstRender.current = false; return; }
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => handleRegenerate(savingsRate), 1000);
+    return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
+  }, [savingsRate]);
+
+  function handleRegenerate(rate = savingsRate) {
+    setIsRegenerating(true); setError(null);
+    try {
+      const data = ResultsAPI.generate(uid, rate);
+      setResults(data);
+    } catch {
+      setError('Failed to regenerate results.');
+    } finally {
+      setIsRegenerating(false);
+    }
+  }
+
+  function formatDate(iso) {
+    return new Date(iso).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+  }
+
+  const roughMonthlyTakeHome = results ? (results.high_tier.debt_projection.median_salary_used / 12) * 0.75 : 4000;
+
+  if (isLoading) return React.createElement('div', { className: 'min-h-screen bg-gray-50' },
+    React.createElement(Navbar),
+    React.createElement('div', { className: 'flex items-center justify-center py-32' },
+      React.createElement('div', { className: 'flex items-center gap-3 text-gray-500' }, React.createElement(Spinner, { size: 5 }), 'Loading your results…')
+    )
+  );
+
+  return React.createElement('div', { className: 'min-h-screen bg-gray-50' },
+    React.createElement(Navbar),
+    React.createElement('div', { className: 'max-w-7xl mx-auto px-4 sm:px-6 py-8 space-y-8' },
+
+      // Header
+      React.createElement('div', { className: 'flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3' },
+        React.createElement('div', null,
+          React.createElement('h1', { className: 'text-2xl font-bold text-gray-900' }, 'Your Career Matches'),
+          results && React.createElement('p', { className: 'text-sm text-gray-500 mt-0.5' }, `Generated ${formatDate(results.created_at)}`)
+        ),
+        React.createElement('button', {
+          onClick: () => handleRegenerate(),
+          disabled: isRegenerating,
+          className: 'inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 disabled:opacity-60',
+        },
+          isRegenerating && React.createElement(Spinner),
+          'Regenerate →'
+        )
+      ),
+
+      isRegenerating && React.createElement('div', { className: 'flex items-center gap-3 bg-blue-50 border border-blue-200 rounded-xl px-5 py-3 text-blue-700 text-sm font-medium' },
+        React.createElement(Spinner),
+        'Searching for jobs…'
+      ),
+
+      error && React.createElement('div', { className: 'bg-red-50 border border-red-200 rounded-xl px-5 py-3 text-red-700 text-sm' }, error),
+
+      results && React.createElement(React.Fragment, null,
+        React.createElement(SavingsRateSlider, { value: savingsRate, onChange: setSavingsRate, monthlyTakeHome: roughMonthlyTakeHome }),
+        React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-3 gap-4' },
+          React.createElement(TierColumn, { tier: results.high_tier, color: 'green', label: 'High Fit' }),
+          React.createElement(TierColumn, { tier: results.mid_tier, color: 'amber', label: 'Mid Fit' }),
+          React.createElement(TierColumn, { tier: results.low_tier, color: 'red', label: 'Low Fit' })
+        ),
+        React.createElement('section', { className: 'space-y-4' },
+          React.createElement('h2', { className: 'text-lg font-bold text-gray-900' }, 'Student Loan Payoff Projection'),
+          React.createElement(LoanProjectionComparison, { high: results.high_tier.debt_projection, mid: results.mid_tier.debt_projection, low: results.low_tier.debt_projection }),
+          React.createElement(PayoffChart, { high: results.high_tier.debt_projection, mid: results.mid_tier.debt_projection, low: results.low_tier.debt_projection })
+        ),
+        React.createElement('section', null,
+          React.createElement('details', { className: 'bg-white rounded-xl border border-gray-200' },
+            React.createElement('summary', { className: 'px-5 py-3 text-sm font-semibold text-gray-700 cursor-pointer select-none list-none flex items-center justify-between' },
+              'Saved Results History',
+              React.createElement('span', { className: 'text-gray-400 text-xs' }, '▾')
+            ),
+            React.createElement('div', { className: 'px-5 pb-4 pt-2 border-t border-gray-100' },
+              React.createElement('p', { className: 'text-xs text-gray-500' },
+                'Latest snapshot generated on ',
+                React.createElement('span', { className: 'font-medium text-gray-700' }, formatDate(results.created_at))
+              )
+            )
+          )
+        )
+      )
+    )
+  );
+}
+
+// ─────────────────────────────────────────────
+//  APP SHELL
+// ─────────────────────────────────────────────
+function ProtectedRoute({ children }) {
+  const { isAuthenticated } = useAuth();
+  const { navigate } = useNav();
+  if (!isAuthenticated) { navigate('/login'); return null; }
+  return children;
+}
+
+function AppRoutes() {
+  const { path } = useNav();
+  if (path === '/' || path === '') return React.createElement(HomePage);
+  if (path === '/login') return React.createElement(LoginPage);
+  if (path === '/register') return React.createElement(RegisterPage);
+  if (path === '/profile') return React.createElement(ProtectedRoute, null, React.createElement(ProfilePage));
+  if (path === '/results') return React.createElement(ProtectedRoute, null, React.createElement(ResultsPage));
+  return React.createElement(HomePage);
+}
+
+function App() {
+  return React.createElement(Router, null,
+    React.createElement(AuthProvider, null,
+      React.createElement(AppRoutes)
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+</script>
+</body>
+</html>
