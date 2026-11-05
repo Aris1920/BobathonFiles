@@ -1,32 +1,64 @@
 # Career & Debt Planner
 
-A full-stack web application that helps US-based students find relevant job opportunities and
+A web application that helps US-based students find relevant job opportunities and
 understand how long it will take to pay off their **student/academic loans** based on the
 salaries those jobs offer.
 
 ---
 
-## Stack
+## Ways to Run
+
+There are **two independent ways** to run this project — pick whichever fits your situation:
+
+| Mode | What runs | When to use |
+|---|---|---|
+| **Standalone `index.html`** | Browser only — no server needed | Quickest start; everything runs in the browser with `localStorage` |
+| **Full stack (Docker / manual)** | React frontend + FastAPI backend + PostgreSQL | Full backend with real API calls and a database |
+
+---
+
+## Standalone Mode (no install required)
+
+Open `index.html` (the file at the root of the repo) directly in any modern browser:
+
+```
+# macOS / Linux
+open index.html
+
+# Windows — double-click the file, or:
+start index.html
+```
+
+The app is entirely self-contained:
+- Auth, profiles, loans, and results are stored in **`localStorage`**.
+- Job listings are mock-generated in the browser; no external API keys are needed.
+- Job listings stay stable between sessions and only refresh when your **major, interests, skills, or resume** change — or when you click **Regenerate →**.
+
+> **Note:** Do not serve this file from a web server using path-based routing (e.g. `python -m http.server`) — the router is hash-based (`#/login`, `#/profile`, etc.) and works correctly only when opened as a local `file://` URL or from the root path `/`.
+
+---
+
+## Full-Stack Mode
+
+### Stack
 
 | Layer | Technology |
 |---|---|
-| Frontend | React 18 + Vite + TypeScript + Tailwind CSS |
+| Frontend | React 18 + Vite + TypeScript + Tailwind CSS + Axios |
 | Backend | Python 3.11 + FastAPI + SQLAlchemy + Alembic |
 | Database | PostgreSQL 16 |
 | Auth | JWT (access + refresh tokens, bcrypt passwords) |
 | Job Data | LinkedIn, Handshake, Indeed, USAJobs |
 | Salary Fallback | BLS Occupational Employment & Wage Statistics API |
 
----
+### Prerequisites
 
-## Prerequisites
-
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (recommended path), **or**
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (recommended), **or**
 - Node.js 20+ and Python 3.11+ for a manual setup.
 
 ---
 
-## Quick Start — Docker Compose (recommended)
+### Quick Start — Docker Compose (recommended)
 
 ```bash
 # 1. Clone the repo
@@ -35,7 +67,7 @@ cd career-debt-planner
 
 # 2. Copy the env template and fill in your API keys
 cp .env.example .env
-# Edit .env — at minimum set SECRET_KEY and any API keys you have
+# Edit .env — at minimum set SECRET_KEY
 
 # 3. Spin everything up
 docker compose up --build
@@ -50,9 +82,9 @@ docker compose up --build
 
 ---
 
-## Manual Setup (no Docker)
+### Manual Setup (no Docker)
 
-### Backend
+#### Backend
 
 ```bash
 cd backend
@@ -61,20 +93,20 @@ cd backend
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
-# Install dependencies
+# Install dependencies (includes dev tools)
 pip install -e ".[dev]"
 
-# Copy env file (adjust DATABASE_URL to point to your local Postgres)
+# Copy env file and adjust DATABASE_URL to point to your local Postgres
 cp ../.env.example ../.env
 
-# Run database migrations (after Sub-Task 2 is complete)
+# Run database migrations
 alembic upgrade head
 
 # Start the dev server
 uvicorn app.main:app --reload --port 8000
 ```
 
-### Frontend
+#### Frontend
 
 ```bash
 cd frontend
@@ -97,7 +129,7 @@ Copy `.env.example` to `.env` and fill in the values.
 
 | Variable | Description |
 |---|---|
-| `DATABASE_URL` | PostgreSQL connection string |
+| `DATABASE_URL` | PostgreSQL connection string (default in docker-compose: `postgresql://postgres:postgres@db:5432/careerplanner`) |
 | `SECRET_KEY` | Random 64-char hex used to sign JWTs — generate with `python -c "import secrets; print(secrets.token_hex(32))"` |
 | `LINKEDIN_CLIENT_ID` | OAuth 2.0 client ID from [LinkedIn Developer Portal](https://developer.linkedin.com/) |
 | `LINKEDIN_CLIENT_SECRET` | OAuth 2.0 client secret |
@@ -112,25 +144,42 @@ Copy `.env.example` to `.env` and fill in the values.
 
 ```
 career-debt-planner/
+├── index.html                  # Standalone single-file app (no build needed)
 ├── backend/
 │   ├── app/
-│   │   ├── __init__.py
-│   │   ├── config.py          # Settings loaded from .env via pydantic-settings
-│   │   └── main.py            # FastAPI app + /health endpoint
-│   ├── tests/
+│   │   ├── config.py           # Settings loaded from .env via pydantic-settings
+│   │   ├── database.py         # SQLAlchemy engine & session factory
+│   │   ├── dependencies.py     # FastAPI dependency injection helpers
+│   │   ├── main.py             # FastAPI app, CORS middleware, router registration
+│   │   ├── models/             # SQLAlchemy ORM models (user, profile, loan, job, projection)
+│   │   ├── routers/            # API route handlers (auth, profile, loans, resume, results, projections)
+│   │   ├── schemas/            # Pydantic request/response schemas
+│   │   └── services/           # Business logic (auth, debt projection, job adapters, scoring, salary)
+│   │       └── job_adapters/   # Per-source adapters: linkedin, handshake, indeed, usajobs
+│   ├── migrations/
+│   │   └── versions/
+│   │       └── 0001_initial_schema.py   # Creates all tables and enum types
+│   ├── tests/                  # pytest test suite
+│   ├── alembic.ini
 │   ├── Dockerfile
 │   └── pyproject.toml
 ├── frontend/
 │   ├── src/
 │   │   ├── main.tsx
-│   │   ├── App.tsx            # React Router + placeholder pages
-│   │   └── index.css          # Tailwind directives
+│   │   ├── App.tsx             # React Router + page wiring
+│   │   ├── index.css           # Tailwind directives
+│   │   ├── api/                # Axios API client modules (auth, profile, loans, resume, results)
+│   │   ├── components/         # Shared UI components (Navbar, JobCard, LoanCard, charts, etc.)
+│   │   ├── context/            # AuthContext (JWT token storage + React context)
+│   │   ├── pages/              # Page components (Login, Register, Profile, Results)
+│   │   └── types/              # Shared TypeScript type definitions
 │   ├── index.html
 │   ├── Dockerfile
 │   ├── package.json
 │   ├── tailwind.config.js
 │   ├── postcss.config.js
-│   └── vite.config.ts
+│   ├── vite.config.ts
+│   └── tsconfig.json
 ├── docker-compose.yml
 ├── .env.example
 ├── .gitignore
