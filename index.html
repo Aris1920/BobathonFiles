@@ -7,6 +7,16 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/prop-types@15/prop-types.min.js" crossorigin></script>
+  <script src="https://unpkg.com/d3-color@3/dist/d3-color.min.js" crossorigin></script>
+  <script src="https://unpkg.com/d3-format@3/dist/d3-format.min.js" crossorigin></script>
+  <script src="https://unpkg.com/d3-interpolate@3/dist/d3-interpolate.min.js" crossorigin></script>
+  <script src="https://unpkg.com/d3-time@3/dist/d3-time.min.js" crossorigin></script>
+  <script src="https://unpkg.com/d3-time-format@4/dist/d3-time-format.min.js" crossorigin></script>
+  <script src="https://unpkg.com/d3-path@3/dist/d3-path.min.js" crossorigin></script>
+  <script src="https://unpkg.com/d3-array@3/dist/d3-array.min.js" crossorigin></script>
+  <script src="https://unpkg.com/d3-scale@4/dist/d3-scale.min.js" crossorigin></script>
+  <script src="https://unpkg.com/d3-shape@3/dist/d3-shape.min.js" crossorigin></script>
   <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js" crossorigin></script>
   <style>
     input[type=range] { accent-color: #2563eb; }
@@ -172,15 +182,41 @@ function generateMockJobs(profile) {
 }
 
 const ResultsAPI = {
-  generate(uid, savingsRate) {
+  // Stable fingerprint of the fields that drive job matching
+  fingerprint(profile) {
+    const parts = [
+      (profile.major || '').trim().toLowerCase(),
+      [...(profile.interests || [])].sort().join(','),
+      [...(profile.skills || [])].sort().join(','),
+      (profile.resume_text || '').trim().toLowerCase(),
+    ];
+    return parts.join('|');
+  },
+
+  // Generates (or regenerates) jobs + debt projections.
+  // Jobs are re-rolled only when the profile fingerprint changed or forceNewJobs=true.
+  generate(uid, savingsRate, forceNewJobs = false) {
     const profile = ProfileAPI.get(uid);
     const loans = LoansAPI.list(uid);
-    const jobs = generateMockJobs(profile);
     const tiers = ['high','mid','low'];
     const medians = { high: 95000, mid: 72000, low: 52000 };
-    const result = { created_at: new Date().toISOString() };
+
+    const existing = DB.get('results_' + uid);
+    const currentFp = ResultsAPI.fingerprint(profile);
+    const profileChanged = !existing || existing._fingerprint !== currentFp;
+
+    // Re-roll jobs if: explicit request, profile changed, or no prior results
+    const needNewJobs = forceNewJobs || profileChanged;
+    const allJobs = needNewJobs
+      ? generateMockJobs(profile)
+      : tiers.flatMap(t => (existing[t + '_tier'] || {}).jobs || []);
+
+    const result = {
+      created_at: needNewJobs ? new Date().toISOString() : existing.created_at,
+      _fingerprint: currentFp,
+    };
     for (const t of tiers) {
-      const tierJobs = jobs.filter(j => j.tier === t);
+      const tierJobs = allJobs.filter(j => j.tier === t);
       const salaries = tierJobs.map(j => j.salary_median_est || ((j.salary_min||0) + (j.salary_max||0)) / 2).filter(Boolean);
       const salMin = salaries.length ? Math.min(...salaries) : medians[t] * 0.85;
       const salMax = salaries.length ? Math.max(...salaries) : medians[t] * 1.15;
@@ -229,18 +265,22 @@ function AuthProvider({ children }) {
 }
 function useAuth() { return useContext(AuthCtx); }
 
-// ── Simple Router ─────────────────────────────
+// ── Simple Router (hash-based for file:// compatibility) ──
 const RouteCtx = createContext({ path: '/', navigate: () => {} });
+function getHash() {
+  const h = window.location.hash.replace(/^#/, '') || '/';
+  return h.startsWith('/') ? h : '/' + h;
+}
 function Router({ children }) {
-  const [path, setPath] = useState(() => window.location.pathname);
+  const [path, setPath] = useState(getHash);
   function navigate(to) {
-    window.history.pushState({}, '', to);
+    window.location.hash = to;
     setPath(to);
   }
   useEffect(() => {
-    const handler = () => setPath(window.location.pathname);
-    window.addEventListener('popstate', handler);
-    return () => window.removeEventListener('popstate', handler);
+    const handler = () => setPath(getHash());
+    window.addEventListener('hashchange', handler);
+    return () => window.removeEventListener('hashchange', handler);
   }, []);
   return React.createElement(RouteCtx.Provider, { value: { path, navigate } }, children);
 }
@@ -248,7 +288,7 @@ function useNav() { return useContext(RouteCtx); }
 function Link({ to, children, className }) {
   const { navigate } = useNav();
   return React.createElement('a', {
-    href: to,
+    href: '#' + to,
     className,
     onClick(e) { e.preventDefault(); navigate(to); },
   }, children);
@@ -761,8 +801,9 @@ function ProfilePage() {
   useEffect(() => {
     const p = ProfileAPI.get(uid);
     const l = LoansAPI.list(uid);
-    setProfile(p || { id: uuid(), user_id: uid, major: '', interests: [], skills: [], experience_level: 'entry', savings: 0, updated_at: new Date().toISOString() });
+    setProfile(p || { id: uuid(), user_id: uid, major: '', interests: [], skills: [], experience_level: 'entry', savings: 0, resume_text: '', updated_at: new Date().toISOString() });
     setLoans(l);
+    if (p && p.resume_text) setResumeText(p.resume_text);
   }, [uid]);
 
   function updateField(key, value) {
@@ -848,7 +889,7 @@ function ProfilePage() {
           React.createElement('h2', { className: 'text-base font-semibold text-gray-800' }, 'Your Resume'),
           React.createElement('p', { className: 'text-sm text-gray-500 mt-0.5' }, 'Optional — uploading your resume improves job match quality.')
         ),
-        React.createElement(ResumeUpload, { onExtracted: setResumeText })
+        React.createElement(ResumeUpload, { onExtracted: text => { setResumeText(text); updateField('resume_text', text); } })
       ),
 
       // Student Loans
@@ -901,10 +942,10 @@ function ResultsPage() {
     return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
   }, [savingsRate]);
 
-  function handleRegenerate(rate = savingsRate) {
+  function handleRegenerate(rate = savingsRate, forceNewJobs = false) {
     setIsRegenerating(true); setError(null);
     try {
-      const data = ResultsAPI.generate(uid, rate);
+      const data = ResultsAPI.generate(uid, rate, forceNewJobs);
       setResults(data);
     } catch {
       setError('Failed to regenerate results.');
@@ -937,7 +978,7 @@ function ResultsPage() {
           results && React.createElement('p', { className: 'text-sm text-gray-500 mt-0.5' }, `Generated ${formatDate(results.created_at)}`)
         ),
         React.createElement('button', {
-          onClick: () => handleRegenerate(),
+          onClick: () => handleRegenerate(savingsRate, true),
           disabled: isRegenerating,
           className: 'inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 disabled:opacity-60',
         },
